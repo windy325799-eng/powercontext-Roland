@@ -565,35 +565,38 @@ def _heading_lines(text: str) -> list[str]:
     return headings
 
 
-def _statement_kinds(text: str) -> tuple[str, ...]:
-    """Name the primary financial statements a page *is*, not pages that cite them."""
+_STATEMENT_TITLES: dict[str, tuple[str, ...]] = {
+    "income": (
+        "consolidated statement of income",
+        "consolidated statements of income",
+        "consolidated statement of operations",
+        "consolidated statements of operations",
+        "consolidated statement of earnings",
+        "consolidated statements of earnings",
+    ),
+    "balance": (
+        "consolidated balance sheet",
+        "consolidated balance sheets",
+        "consolidated statements of financial position",
+    ),
+    "cashflow": (
+        "consolidated statement of cash flows",
+        "consolidated statements of cash flows",
+        "consolidated statement of cash flow",
+    ),
+}
 
-    head = "\n".join(line.strip() for line in text.splitlines() if line.strip())[:600].casefold()
-    kinds = []
-    if any(
-        title in head
-        for title in (
-            "consolidated statement of income",
-            "consolidated statements of income",
-            "consolidated statement of operations",
-            "consolidated statements of operations",
-            "consolidated statements of earnings",
-            "consolidated statement of earnings",
-        )
-    ):
-        kinds.append("income")
-    if any(
-        title in head
-        for title in (
-            "consolidated balance sheet",
-            "consolidated balance sheets",
-            "consolidated statements of financial position",
-        )
-    ):
-        kinds.append("balance")
-    if "consolidated statement of cash flows" in head or "consolidated statements of cash flows" in head:
-        kinds.append("cashflow")
-    return tuple(kinds)
+
+def _statement_kinds(text: str) -> tuple[str, ...]:
+    """Name the primary financial statements a page *is*.
+
+    A page only counts when the statement title stands alone on one of its leading
+    lines. Notes and index pages that mention a title inside a sentence or a table of
+    contents entry are not the statement document.
+    """
+
+    lines = [line.strip().casefold() for line in text.splitlines() if line.strip()][:12]
+    return tuple(kind for kind, titles in _STATEMENT_TITLES.items() if any(line in titles for line in lines))
 
 
 def _phrase_tokens(phrase: str) -> tuple[str, ...]:
@@ -749,32 +752,51 @@ def _rank_pages(
             score *= max(prior.get(kind, 1.0) for kind in page.statement_kinds)
         if page.head_text.casefold().startswith("exhibit"):
             score *= _EXHIBIT_PENALTY
-        if exhibit_start and page.page_number > exhibit_start:
+        if page.page_number > exhibit_start.get(page.document_id, 0):
             score *= _EXHIBIT_PENALTY
         scored.append((score, -page.page_number, page))
-    scored.sort(reverse=True)
+    scored.sort(key=_score_order, reverse=True)
 
     targets = _statement_targets(question)
     top_score = scored[0][0] if scored else 0.0
     if targets and top_score > 0:
-        boosted = [
-            (score + (_STATEMENT_INJECTION * top_score if set(page.statement_kinds) & targets else 0.0), position, page)
+        # Primary statements are high-value evidence for metric questions. Inject only the
+        # strongest matches so a multi-document collection cannot flood the result page.
+        injectable = [
+            (score, position, page)
             for score, position, page in scored
+            if set(page.statement_kinds) & targets
         ]
-        boosted.sort(reverse=True)
-        scored = boosted
+        injected = {
+            id(page) for _score, _position, page in sorted(injectable, key=_score_order, reverse=True)[:6]
+        }
+        if injected:
+            boosted = [
+                (
+                    score + (_STATEMENT_INJECTION * top_score if id(page) in injected else 0.0),
+                    position,
+                    page,
+                )
+                for score, position, page in scored
+            ]
+            boosted.sort(key=_score_order, reverse=True)
+            scored = boosted
     return [page for _score, _position, page in scored]
 
 
-def _exhibit_index_start(pages: tuple[_IndexedPage, ...]) -> int:
-    """Find where the 10-K attachment section begins; exhibits are not evidence."""
+def _score_order(item: tuple[float, int, _IndexedPage]) -> tuple[float, int, str]:
+    return item[0], item[1], item[2].document_id
 
-    start = 0
+
+def _exhibit_index_start(pages: tuple[_IndexedPage, ...]) -> dict[str, int]:
+    """Find where each 10-K attachment section begins; exhibits are not evidence."""
+
+    starts: dict[str, int] = {}
     for page in pages:
         lowered = page.text.casefold()
         if "exhibit index" in lowered or "exhibits filed" in lowered:
-            start = max(start, page.page_number)
-    return start
+            starts[page.document_id] = max(starts.get(page.document_id, 0), page.page_number)
+    return starts
 
 
 __all__ = [
